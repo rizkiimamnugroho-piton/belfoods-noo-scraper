@@ -1,0 +1,26 @@
+name: scrape
+
+on:
+  workflow_dispatch:      # dipanggil oleh Apps Script (kickScraper)
+
+concurrency:
+  group: scraper          # hanya 1 run berjalan; sisanya antre
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - run: playwright install --with-deps chromium
+      - run: python worker.py
+        env:
+          GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+          PIN_BASE_URL: ${{ secrets.PIN_BASE_URL }}
