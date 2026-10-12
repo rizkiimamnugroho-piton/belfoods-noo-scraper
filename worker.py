@@ -60,6 +60,22 @@ def upd(ws, hdr, row, **vals):
     )
 
 
+def get_log_ws(ss):
+    try:
+        return ss.worksheet("Run_Log")
+    except gspread.WorksheetNotFound:
+        ws = ss.add_worksheet("Run_Log", 1000, 4)
+        ws.append_row(["TIME", "SOURCE", "EVENT", "DETAIL"])
+        return ws
+
+
+def log(ws, event, detail=""):
+    try:
+        ws.append_row([now(), "GitHub", event, str(detail)[:300]], value_input_option="RAW")
+    except Exception:
+        pass
+
+
 def load_points(pts_ws):
     hdr, rows = read(pts_ws, unformatted=True)
     df = pd.DataFrame(rows, columns=hdr)
@@ -125,8 +141,10 @@ def main():
     gc = gspread.service_account_from_dict(json.loads(os.environ["GCP_SA_JSON"]))
     ss = gc.open_by_key(SHEET_ID)
     req_ws, pts_ws = ss.worksheet("Scrape_Request"), ss.worksheet("Map_Points")
+    log_ws = get_log_ws(ss)
     pts_hdr, cov, known = load_points(pts_ws)
     print(f"Covered dengan GPS: {len(cov)}")
+    log(log_ws, "START", f"Covered dengan GPS: {len(cov)}")
 
     t0 = time.time()
     while time.time() - t0 < MAX_RUNTIME_MIN * 60:
@@ -135,6 +153,7 @@ def main():
         todo = [(i + 2, dict(zip(hdr, r))) for i, r in enumerate(rows) if r[ist] == "Queued"]
         if not todo:
             print("Antrean kosong, selesai.")
+            log(log_ws, "IDLE", "Antrean kosong (tidak ada STATUS persis 'Queued')")
             break
         rn, req = todo[0]
         attempts = int(float(req.get("ATTEMPTS") or 0)) + 1
@@ -144,6 +163,7 @@ def main():
             n_raw, n_cov, n_dup, new_rows = process(req, pts_hdr, cov, known)
             if n_raw == 0 and attempts < MAX_ATTEMPTS:
                 upd(req_ws, hdr, rn, STATUS="Queued", MESSAGE="0 hasil, mengulang otomatis...")
+                log(log_ws, "RETRY", f"{req['REQUEST_ID']}: 0 hasil, percobaan {attempts}")
                 time.sleep(20)
                 continue
             if new_rows:
@@ -152,11 +172,13 @@ def main():
                    if n_raw else "0 hasil dari Google Maps (cek keyword/area, atau kemungkinan diblokir)")
             upd(req_ws, hdr, rn, STATUS="Done", MESSAGE=msg, DONE_AT=now(), RESULT_COUNT=len(new_rows))
             print(f"Selesai: {len(new_rows)} NOO baru")
+            log(log_ws, "DONE", f"{req['REQUEST_ID']}: {msg}")
         except Exception as e:
             status = "Queued" if attempts < MAX_ATTEMPTS else "Failed"
             upd(req_ws, hdr, rn, STATUS=status, MESSAGE=f"Error: {str(e)[:150]}",
                 DONE_AT=now() if status == "Failed" else "")
             print(f"Gagal ({status}): {str(e)[:150]}")
+            log(log_ws, "ERROR", f"{req['REQUEST_ID']} ({status}): {str(e)[:200]}")
 
 
 if __name__ == "__main__":
