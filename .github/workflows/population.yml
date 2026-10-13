@@ -1,0 +1,19 @@
+name: population
+
+on:
+  workflow_dispatch:      # jalankan manual dari tab Actions (cukup setahun sekali)
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install rasterio numpy gspread google-auth
+      - run: python build_population.py
+        env:
+          GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
+          SHEET_ID: ${{ secrets.SHEET_ID }}
