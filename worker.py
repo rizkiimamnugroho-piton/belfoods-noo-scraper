@@ -22,6 +22,7 @@ RADIUS_M = 50          # jarak maksimal dianggap outlet yang sama
 NAME_SIM = 0.6         # kemiripan nama minimal (0-1)
 MAX_ATTEMPTS = 2       # percobaan ulang otomatis kalau gagal / 0 hasil
 MAX_RUNTIME_MIN = 45   # batas waktu satu run
+IDLE_MAX_S = 600       # setelah antrean kosong, worker menunggu 10 menit (request berikutnya langsung diproses)
 WIB = timezone(timedelta(hours=7))
 
 
@@ -127,6 +128,7 @@ def process(req, pts_hdr, cov, known):
             "OUTLET STATUS": "NOO",
             "KAB/KOTA": req.get("KAB/KOTA", ""), "KECAMATAN": req.get("KECAMATAN", ""),
             "KELURAHAN": r["Kelurahan"], "ALAMAT": r["Alamat"],
+            "KODEPOS": (re.search(r"\b(\d{5})\b", str(r["Alamat"])) or [0, ""])[1],
             "LATLONG": f"{lat}, {lon}", "LAT": lat, "LONG": lon,
             "PIN_ICON": PIN_BASE + "noo.png", "NOO_STATUS": "New",
             "KEYWORD": r["Keyword_Pencarian"],
@@ -147,14 +149,21 @@ def main():
     log(log_ws, "START", f"Covered dengan GPS: {len(cov)}")
 
     t0 = time.time()
+    idle_since = None
     while time.time() - t0 < MAX_RUNTIME_MIN * 60:
         hdr, rows = read(req_ws)
         ist = hdr.index("STATUS")
         todo = [(i + 2, dict(zip(hdr, r))) for i, r in enumerate(rows) if r[ist] == "Queued"]
         if not todo:
-            print("Antrean kosong, selesai.")
-            log(log_ws, "IDLE", "Antrean kosong (tidak ada STATUS persis 'Queued')")
-            break
+            if idle_since is None:
+                idle_since = time.time()
+            if time.time() - idle_since > IDLE_MAX_S:
+                print("Antrean kosong, selesai.")
+                log(log_ws, "IDLE", "Antrean kosong, worker berhenti")
+                break
+            time.sleep(15)
+            continue
+        idle_since = None
         rn, req = todo[0]
         attempts = int(float(req.get("ATTEMPTS") or 0)) + 1
         upd(req_ws, hdr, rn, STATUS="Running", STARTED_AT=now(), ATTEMPTS=attempts, MESSAGE="")
