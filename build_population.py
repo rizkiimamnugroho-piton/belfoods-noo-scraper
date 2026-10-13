@@ -7,9 +7,30 @@ Sel yang disimpan: radius RADIUS sel di sekitar outlet covered tiap distributor.
 import os, json, urllib.request
 import numpy as np, rasterio, gspread
 
-URL = os.environ.get("POP_URL", "https://data.worldpop.org/GIS/Population/Global_2000_2020_1km/2020/IDN/idn_ppp_2020_1km_Aggregated.tif")
+PATH = "GIS/Population/Global_2000_2020_1km/2020/IDN/idn_ppp_2020_1km_Aggregated.tif"
+URLS = [u for u in [os.environ.get("POP_URL"), "https://data.worldpop.org/" + PATH,
+                    "https://worldpop-public-data.soton.ac.uk/" + PATH] if u]
 RADIUS = 2
 CHUNK = 20000
+
+
+def download(urls, dest):
+    last = None
+    for u in urls:
+        try:
+            req = urllib.request.Request(u, headers={"User-Agent": "Mozilla/5.0 (Belfoods-RTM population builder)"})
+            with urllib.request.urlopen(req, timeout=300) as r, open(dest, "wb") as f:
+                while True:
+                    b = r.read(1 << 20)
+                    if not b:
+                        break
+                    f.write(b)
+            print("Unduh OK:", u, os.path.getsize(dest), "byte")
+            return
+        except Exception as e:
+            last = e
+            print("Gagal unduh", u, "->", e)
+    raise RuntimeError("Semua alamat unduhan gagal: " + str(last))
 
 
 def build_rows(tif, outlets):
@@ -61,7 +82,7 @@ def main():
     outlets = [(r[iD], float(r[iLa]), float(r[iLo])) for r in vals[1:]
                if r[iT] == "COVERED" and isinstance(r[iLa], (int, float)) and isinstance(r[iLo], (int, float))]
     print("Outlet covered:", len(outlets))
-    urllib.request.urlretrieve(URL, "/tmp/pop.tif")
+    download(URLS, "/tmp/pop.tif")
     meta, rows, index = build_rows("/tmp/pop.tif", outlets)
     print("Sel:", len(rows), "Distributor:", len(index))
     put(ss, "Penduduk", ["DISTRIBUTOR", "R", "C", "PENDUDUK"], rows)
