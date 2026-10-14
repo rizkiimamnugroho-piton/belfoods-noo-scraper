@@ -5,7 +5,7 @@ WORKER NOO FINDER  (dijalankan otomatis oleh GitHub Actions)
 - Buang hasil yang sudah Covered (<= 50 m dan nama mirip), tulis sisanya ke Map_Points sebagai NOO
 CATATAN: log GitHub di repo public bisa dibaca siapa saja -> jangan print data internal.
 """
-import os, json, re, time, uuid
+import os, json, re, time, uuid, io, math, contextlib
 from datetime import datetime, timezone, timedelta
 from difflib import SequenceMatcher
 
@@ -46,6 +46,36 @@ def dist_m(lat, lon, lats, lons):
     p1, p2 = np.radians(lat), np.radians(lats)
     a = np.sin((p2 - p1) / 2) ** 2 + np.cos(p1) * np.cos(p2) * np.sin(np.radians(lons - lon) / 2) ** 2
     return 2 * R * np.arcsin(np.sqrt(a))
+
+
+def zoom_for(radius_m, lat):
+    """Zoom Google Maps agar lebar peta kira-kira 2 x radius (peta efektif ~880 px)."""
+    mpp = 2 * radius_m / 880.0
+    z = math.log2(156543.03 * math.cos(math.radians(lat)) / mpp)
+    return max(12, min(18, round(z)))
+
+
+def to_float(x):
+    return float(str(x).replace(",", "."))
+
+
+def norm_kab(s):
+    s = re.sub(r"\s+", " ", str(s).upper().replace(".", " ")).strip()
+    if s in ("", "-"):
+        return ""
+    s = re.sub(r"^KABUPATEN ", "KAB. ", s)
+    s = re.sub(r"^KAB ", "KAB. ", s)
+    return re.sub(r"^KOTA ADMINISTRASI ", "KOTA ", s)
+
+
+def norm_kec(s):
+    s = re.sub(r"\s+", " ", str(s).upper().replace(".", " ")).strip()
+    return "" if s in ("", "-") else re.sub(r"^(KECAMATAN|KEC) ", "", s)
+
+
+def mask(s):
+    """Sembunyikan koordinat lokasi pengguna dari teks yang dicetak ke log GitHub (log repo public bisa dibaca siapa saja)."""
+    return re.sub(r"@-?\d+\.\d+,-?\d+\.\d+", "@LOKASI", s)
 
 
 def read(ws, unformatted=False):
@@ -91,13 +121,37 @@ def load_points(pts_ws):
 def process(req, pts_hdr, cov, known):
     kws = [k.strip() for k in str(req["KEYWORD"]).split(",") if k.strip()]
     n = int(float(req.get("MAX_RESULTS") or 20))
-    area = " ".join(
-        str(req.get(k, "")).strip() for k in ("KELURAHAN", "KECAMATAN", "KAB/KOTA")
-        if str(req.get(k, "")).strip().upper() not in ("", "ALL")
-    )
-    raw = []
-    for kw in kws:
-        raw += so.scrape_google_maps(f"{kw} {area}".strip(), n)
+    nearby = str(req.get("MODE", "")).strip().upper() == "NEARBY"
+    raw, extra = [], ""
+    if nearby:
+        # Mode "dekat lokasi saya": cari di sekitar titik (LAT, LONG) dengan RADIUS_M, urut dari yang terdekat.
+        la0, lo0, rad = to_float(req["LAT"]), to_float(req["LONG"]), int(float(req["RADIUS_M"]))
+        z = zoom_for(rad, la0)
+        extra = f" dalam radius {rad} m"
+        for kw in kws:
+            q = f"{kw}/@{la0:.6f},{lo0:.6f},{z}z"
+            with contextlib.redirect_stdout(io.StringIO()):      # log scraper memuat URL berisi lokasi pengguna, jangan dicetak
+                res = so.scrape_google_maps(q, min(n * 2, 60))
+            keep = []
+            for r in res:
+                try:
+                    lat, lon = float(r["Lat"]), float(r["Long"])
+                except (TypeError, ValueError):
+                    continue
+                dm = float(dist_m(la0, lo0, np.array([lat]), np.array([lon]))[0])
+                if dm <= rad * 1.05:
+                    r["Keyword_Pencarian"] = kw
+                    r["_jarak"] = dm
+                    keep.append(r)
+            keep.sort(key=lambda r: r["_jarak"])
+            raw += keep[:n]
+    else:
+        area = " ".join(
+            str(req.get(k, "")).strip() for k in ("KELURAHAN", "KECAMATAN", "KAB/KOTA")
+            if str(req.get(k, "")).strip().upper() not in ("", "ALL")
+        )
+        for kw in kws:
+            raw += so.scrape_google_maps(f"{kw} {area}".strip(), n)
 
     cl, cn = cov["LAT"].to_numpy(), cov["LONG"].to_numpy()
     names = cov["OUTLET NAME"].tolist()
@@ -122,11 +176,14 @@ def process(req, pts_hdr, cov, known):
                 n_cov += 1
                 continue
 
+        kab, kec = req.get("KAB/KOTA", ""), req.get("KECAMATAN", "")
+        if nearby:                                  # wilayah diambil dari hasil reverse-geocoding titiknya
+            kab, kec = norm_kab(r["Kab/Kota"]), norm_kec(r["Kecamatan"])
         o = {
             "KEY": "NOO-" + uuid.uuid4().hex[:10].upper(), "TYPE": "NOO",
             "OUTLET NAME": r["Nama"], "DISTRIBUTOR NAME": req["DISTRIBUTOR NAME"],
             "OUTLET STATUS": "NOO",
-            "KAB/KOTA": req.get("KAB/KOTA", ""), "KECAMATAN": req.get("KECAMATAN", ""),
+            "KAB/KOTA": kab, "KECAMATAN": kec,
             "KELURAHAN": r["Kelurahan"], "ALAMAT": r["Alamat"],
             "KODEPOS": (re.search(r"\b(\d{5})\b", str(r["Alamat"])) or [0, ""])[1],
             "LATLONG": f"{lat}, {lon}", "LAT": lat, "LONG": lon,
@@ -136,7 +193,7 @@ def process(req, pts_hdr, cov, known):
             "SCRAPED_AT": now(), "USER_EMAIL": req["USER_EMAIL"], "REQUEST_ID": req["REQUEST_ID"],
         }
         new_rows.append([o.get(h, "") for h in pts_hdr])
-    return len(raw), n_cov, n_dup, new_rows
+    return len(raw), n_cov, n_dup, new_rows, extra
 
 
 def main():
@@ -169,7 +226,7 @@ def main():
         upd(req_ws, hdr, rn, STATUS="Running", STARTED_AT=now(), ATTEMPTS=attempts, MESSAGE="")
         print(f"Memproses {req['REQUEST_ID']} (percobaan {attempts})")
         try:
-            n_raw, n_cov, n_dup, new_rows = process(req, pts_hdr, cov, known)
+            n_raw, n_cov, n_dup, new_rows, extra = process(req, pts_hdr, cov, known)
             if n_raw == 0 and attempts < MAX_ATTEMPTS:
                 upd(req_ws, hdr, rn, STATUS="Queued", MESSAGE="0 hasil, mengulang otomatis...")
                 log(log_ws, "RETRY", f"{req['REQUEST_ID']}: 0 hasil, percobaan {attempts}")
@@ -177,8 +234,9 @@ def main():
                 continue
             if new_rows:
                 pts_ws.append_rows(new_rows, value_input_option="RAW", table_range="A1")
-            msg = (f"{n_raw} ditemukan, {n_cov} sudah Covered, {n_dup} duplikat, {len(new_rows)} NOO baru"
-                   if n_raw else "0 hasil dari Google Maps (cek keyword/area, atau kemungkinan diblokir)")
+            msg = (f"{n_raw} ditemukan{extra}, {n_cov} sudah Covered, {n_dup} duplikat, {len(new_rows)} NOO baru"
+                   if n_raw else "0 hasil" + (extra + " (coba radius lebih besar atau keyword lain)" if extra
+                                              else " dari Google Maps (cek keyword/area, atau kemungkinan diblokir)"))
             upd(req_ws, hdr, rn, STATUS="Done", MESSAGE=msg, DONE_AT=now(), RESULT_COUNT=len(new_rows))
             print(f"Selesai: {len(new_rows)} NOO baru")
             log(log_ws, "DONE", f"{req['REQUEST_ID']}: {msg}")
@@ -186,7 +244,7 @@ def main():
             status = "Queued" if attempts < MAX_ATTEMPTS else "Failed"
             upd(req_ws, hdr, rn, STATUS=status, MESSAGE=f"Error: {str(e)[:150]}",
                 DONE_AT=now() if status == "Failed" else "")
-            print(f"Gagal ({status}): {str(e)[:150]}")
+            print(f"Gagal ({status}): {mask(str(e))[:150]}")
             log(log_ws, "ERROR", f"{req['REQUEST_ID']} ({status}): {str(e)[:200]}")
 
 
