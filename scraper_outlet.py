@@ -1,6 +1,8 @@
 """
 =============================================================
   SCRAPER DATA OUTLET DARI GOOGLE MAPS  (v6 - multi-keyword)
+  + v6.1 anti-blokir: UA tidak 'HeadlessChrome', consent otomatis, retry koneksi,
+    deteksi captcha/halaman asing (strict=True dipakai worker: raise MapsBlocked, bukan diam-diam 0 hasil)
   - headless mode (tanpa tampilan browser) = lebih cepat
   - wait for selector, bukan sleep tetap
   - scroll adaptif (berhenti otomatis jika tidak ada item baru)
@@ -14,6 +16,7 @@
 import time
 import re
 import json
+import random
 import urllib.request
 import urllib.parse
 import pandas as pd
@@ -194,127 +197,219 @@ def scrape_detail(page) -> dict:
     return {"Nama": nama, "Alamat": alamat}
 
 
-def scrape_google_maps(keyword: str, jumlah: int) -> list:
+class MapsBlocked(Exception):
+    """Google Maps menolak / membatasi akses (captcha, consent tak bisa dilewati, halaman asing, koneksi ditutup)."""
+
+
+def _goto_dengan_retry(page, url):
+    """goto halaman pencarian; error koneksi (net::ERR_*) dicoba ulang 1x setelah jeda, lalu dilempar apa adanya."""
+    for t in range(2):
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=45000)
+            return
+        except Exception as e:
+            if t == 0 and "net::ERR" in str(e):
+                print("         → koneksi ditolak, coba ulang sekali setelah jeda...")
+                time.sleep(random.uniform(8, 14))
+                continue
+            raise
+
+
+def _tangani_consent(page, url):
+    """Kalau diarahkan ke halaman consent Google, klik setujui lalu buka ulang URL pencarian."""
+    if "consent.google" not in page.url and "consent.youtube" not in page.url:
+        return
+    print("         → halaman consent Google, mencoba menyetujui...")
+    try:
+        page.locator("button:has-text('Terima semua'), button:has-text('Accept all'), button:has-text('Setuju')").first.click(timeout=6000)
+        page.wait_for_load_state("domcontentloaded", timeout=15000)
+    except Exception:
+        pass
+    if "consent." in page.url:
+        _goto_dengan_retry(page, url)
+
+
+def _jenis_halaman(page) -> str:
+    """SORRY (captcha/unusual traffic) | CONSENT | NOHASIL (Google bilang memang tidak ada hasil) | ASING (tidak dikenali)"""
+    u = page.url
+    if "/sorry/" in u or "recaptcha" in u:
+        return "SORRY"
+    if "consent." in u:
+        return "CONSENT"
+    try:
+        t = page.inner_text("body", timeout=3000).lower()
+    except Exception:
+        t = ""
+    if "unusual traffic" in t or "lalu lintas yang tidak biasa" in t or "captcha" in t:
+        return "SORRY"
+    if "tidak dapat menemukan" in t or "can't find" in t or "cannot find" in t:
+        return "NOHASIL"
+    return "ASING"
+
+
+def scrape_google_maps(keyword: str, jumlah: int, strict: bool = False) -> list:
+    """
+    strict=False (default, perilaku lama CLI): panel tidak muncul -> print error, return [].
+    strict=True  (dipakai worker): bedakan "memang tidak ada hasil" (return []) dari "diblokir / halaman asing"
+                 (raise MapsBlocked), supaya worker bisa menunda scraper, bukan mencatat 0 hasil palsu.
+    """
     hasil = []
 
     with sync_playwright() as p:
         print("[INFO] Membuka browser (headless/tanpa tampilan)...")
-        browser = p.chromium.launch(headless=True)
-        context = browser.new_context(viewport={"width": 1280, "height": 900}, locale="id-ID")
-        page    = context.new_page()
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--disable-blink-features=AutomationControlled", "--disable-dev-shm-usage"],
+        )
+        try:
+            # UA headless bawaan memuat "HeadlessChrome" (tanda bot paling jelas) -> ganti dengan UA Chrome biasa
+            ua = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+                  f"Chrome/{browser.version} Safari/537.36")
+            context = browser.new_context(
+                viewport={"width": 1280, "height": 900}, locale="id-ID", timezone_id="Asia/Jakarta",
+                user_agent=ua, extra_http_headers={"Accept-Language": "id-ID,id;q=0.9,en;q=0.8"},
+            )
+            context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")
+            try:
+                context.add_cookies([{"name": "CONSENT", "value": "YES+", "domain": ".google.com", "path": "/"}])
+            except Exception:
+                pass
+            page = context.new_page()
 
-        url = f"https://www.google.com/maps/search/{keyword.replace(' ', '+')}"
-        print(f"[INFO] URL: {url}")
-        page.goto(url, wait_until="domcontentloaded")
+            url = f"https://www.google.com/maps/search/{keyword.replace(' ', '+')}"
+            print(f"[INFO] URL: {url}")
+            _goto_dengan_retry(page, url)
+            _tangani_consent(page, url)
 
-        panel_selector = 'div[role="feed"]'
-        print(f"[INFO] Scroll untuk kumpulkan {jumlah} outlet...")
+            panel_selector = 'div[role="feed"]'
+            print(f"[INFO] Scroll untuk kumpulkan {jumlah} outlet...")
 
-        # Kadang Google Maps langsung redirect ke halaman detail outlet
-        # (bukan ke daftar/feed) kalau hasil pencariannya cuma 1.
-        # Cek dulu URL saat ini sebelum nunggu panel feed.
-        time.sleep(1.5)
-        if "/maps/place/" in page.url:
-            print("         → Hasil cuma 1 outlet, langsung ke halaman detail (tidak ada daftar/feed).")
-            hrefs = [page.url]
-        else:
-            panel_ok = False
-            for percobaan in range(2):  # coba 2x sebelum menyerah
-                try:
-                    page.wait_for_selector(panel_selector, timeout=20000)
-                    panel_ok = True
-                    break
-                except PWTimeout:
-                    if "/maps/place/" in page.url:
-                        # redirect terjadi belakangan (lambat)
-                        panel_ok = False
-                        break
-                    print(f"         → Panel belum muncul, coba ulang ({percobaan+1}/2)...")
-                    page.goto(url, wait_until="domcontentloaded")
-                    time.sleep(1.5)
-
+            # Kadang Google Maps langsung redirect ke halaman detail outlet
+            # (bukan ke daftar/feed) kalau hasil pencariannya cuma 1.
+            # Cek dulu URL saat ini sebelum nunggu panel feed.
+            time.sleep(1.5)
             if "/maps/place/" in page.url:
                 print("         → Hasil cuma 1 outlet, langsung ke halaman detail (tidak ada daftar/feed).")
                 hrefs = [page.url]
-            elif not panel_ok:
-                print("[ERROR] Panel tidak muncul setelah 2x percobaan. Keyword ini dilewati.")
-                browser.close()
-                return []
             else:
-                # Scroll adaptif — berhenti otomatis jika 5x scroll tidak ada item baru
-                stagnant = 0
-                prev_count = 0
-                hrefs = []
-                for i in range(60):
-                    hrefs = page.eval_on_selector_all(
-                        'a[href*="/maps/place/"]',
-                        "els => els.map(e => e.href)"
-                    )
-                    hrefs = list(dict.fromkeys(hrefs))
-                    print(f"         → {len(hrefs)} item (scroll ke-{i+1})")
-                    if len(hrefs) >= jumlah:
+                panel_ok = False
+                for percobaan in range(2):  # coba 2x sebelum menyerah
+                    try:
+                        page.wait_for_selector(panel_selector, timeout=20000)
+                        panel_ok = True
                         break
-                    if len(hrefs) == prev_count:
-                        stagnant += 1
-                        if stagnant >= 5:
-                            print("         → tidak ada item baru, lanjut scraping...")
+                    except PWTimeout:
+                        if "/maps/place/" in page.url:
+                            # redirect terjadi belakangan (lambat)
+                            panel_ok = False
                             break
-                    else:
-                        stagnant = 0
-                    prev_count = len(hrefs)
-                    page.evaluate(f"document.querySelector('{panel_selector}').scrollBy(0, 3000)")
-                    time.sleep(0.8)  # lebih cepat dari sebelumnya (was 1.5s)
+                        if percobaan == 0 and _jenis_halaman(page) in ("SORRY", "NOHASIL"):
+                            break   # captcha / memang tidak ada hasil: mengulang tidak ada gunanya
+                        print(f"         → Panel belum muncul, coba ulang ({percobaan+1}/2)...")
+                        _goto_dengan_retry(page, url)
+                        _tangani_consent(page, url)
+                        time.sleep(1.5)
 
-        hrefs = hrefs[:jumlah]
-        total = len(hrefs)
-        print(f"[INFO] Total outlet: {total}\n")
+                if "/maps/place/" in page.url:
+                    print("         → Hasil cuma 1 outlet, langsung ke halaman detail (tidak ada daftar/feed).")
+                    hrefs = [page.url]
+                elif not panel_ok:
+                    jenis = _jenis_halaman(page)
+                    print(f"[ERROR] Panel tidak muncul ({jenis}). Keyword ini dilewati.")
+                    if strict and jenis == "SORRY":
+                        raise MapsBlocked("MapsBlocked: Google meminta verifikasi (captcha / unusual traffic)")
+                    if strict and jenis in ("ASING", "CONSENT"):
+                        raise MapsBlocked("MapsBlocked: panel hasil tidak muncul dan halaman tidak dikenali "
+                                          "(kemungkinan akses dibatasi Google atau tampilan Maps berubah)")
+                    return []
+                else:
+                    # Scroll adaptif — berhenti otomatis jika 5x scroll tidak ada item baru
+                    stagnant = 0
+                    prev_count = 0
+                    hrefs = []
+                    for i in range(60):
+                        hrefs = page.eval_on_selector_all(
+                            'a[href*="/maps/place/"]',
+                            "els => els.map(e => e.href)"
+                        )
+                        hrefs = list(dict.fromkeys(hrefs))
+                        print(f"         → {len(hrefs)} item (scroll ke-{i+1})")
+                        if len(hrefs) >= jumlah:
+                            break
+                        if len(hrefs) == prev_count:
+                            stagnant += 1
+                            if stagnant >= 5:
+                                print("         → tidak ada item baru, lanjut scraping...")
+                                break
+                        else:
+                            stagnant = 0
+                        prev_count = len(hrefs)
+                        page.evaluate(f"document.querySelector('{panel_selector}').scrollBy(0, 3000)")
+                        time.sleep(0.8)  # lebih cepat dari sebelumnya (was 1.5s)
 
-        for i, href in enumerate(hrefs, 1):
-            try:
-                page.goto(href, wait_until="domcontentloaded")
+            hrefs = hrefs[:jumlah]
+            total = len(hrefs)
+            print(f"[INFO] Total outlet: {total}\n")
 
-                # Tunggu h1 muncul (lebih cepat dari sleep tetap)
+            gagal_net = 0   # error koneksi beruntun saat membuka halaman outlet
+            for i, href in enumerate(hrefs, 1):
                 try:
-                    page.wait_for_selector('h1', timeout=6000)
-                except PWTimeout:
-                    pass
+                    time.sleep(random.uniform(0.3, 0.9))   # jeda kecil acak antar halaman outlet
+                    page.goto(href, wait_until="domcontentloaded")
 
-                # Tunggu URL punya koordinat (max 4 detik)
-                for _ in range(8):
+                    # Tunggu h1 muncul (lebih cepat dari sleep tetap)
+                    try:
+                        page.wait_for_selector('h1', timeout=6000)
+                    except PWTimeout:
+                        pass
+
+                    # Tunggu URL punya koordinat (max 4 detik)
+                    for _ in range(8):
+                        current_url = page.url
+                        if re.search(r'/@-?\d+\.\d+,-?\d+\.\d+', current_url):
+                            break
+                        time.sleep(0.5)
+
                     current_url = page.url
-                    if re.search(r'/@-?\d+\.\d+,-?\d+\.\d+', current_url):
+                    lat, lon    = parse_latlong_dari_url(current_url)
+                    detail      = scrape_detail(page)
+
+                    wilayah = None
+                    if GUNAKAN_REVERSE_GEOCODING:
+                        wilayah = ambil_wilayah_dari_koordinat(lat, lon)
+                        time.sleep(1.05)  # jaga rate limit Nominatim (maks 1 request/detik)
+                    if not wilayah:
+                        wilayah = parse_wilayah_dari_alamat(detail["Alamat"])
+
+                    print(f"[{i}/{total}] {detail['Nama'][:50]}")
+                    print(f"         {wilayah['Kelurahan']} | {wilayah['Kecamatan']} | {wilayah['Kab/Kota']} | {lat}, {lon}")
+
+                    hasil.append({
+                        "Nama"      : detail["Nama"],
+                        "Alamat"    : detail["Alamat"],
+                        "Kelurahan" : wilayah["Kelurahan"],
+                        "Kecamatan" : wilayah["Kecamatan"],
+                        "Kab/Kota"  : wilayah["Kab/Kota"],
+                        "Lat"       : lat,
+                        "Long"      : lon,
+                        "Keyword_Pencarian": keyword,
+                    })
+                    gagal_net = 0
+
+                except Exception as e:
+                    print(f"[{i}/{total}] ✗ Gagal: {e}")
+                    gagal_net = gagal_net + 1 if "net::ERR" in str(e) else 0
+                    if gagal_net >= 3:     # koneksi ditutup berulang di tengah jalan: berhenti, jangan lanjut menekan Google
+                        print("[ERROR] 3 kegagalan koneksi beruntun, scraping dihentikan.")
+                        if strict and not hasil:
+                            raise MapsBlocked("MapsBlocked: koneksi ke Google Maps ditutup berulang saat membuka halaman outlet "
+                                              "(net::ERR_CONNECTION)")
                         break
-                    time.sleep(0.5)
-
-                current_url = page.url
-                lat, lon    = parse_latlong_dari_url(current_url)
-                detail      = scrape_detail(page)
-
-                wilayah = None
-                if GUNAKAN_REVERSE_GEOCODING:
-                    wilayah = ambil_wilayah_dari_koordinat(lat, lon)
-                    time.sleep(1.05)  # jaga rate limit Nominatim (maks 1 request/detik)
-                if not wilayah:
-                    wilayah = parse_wilayah_dari_alamat(detail["Alamat"])
-
-                print(f"[{i}/{total}] {detail['Nama'][:50]}")
-                print(f"         {wilayah['Kelurahan']} | {wilayah['Kecamatan']} | {wilayah['Kab/Kota']} | {lat}, {lon}")
-
-                hasil.append({
-                    "Nama"      : detail["Nama"],
-                    "Alamat"    : detail["Alamat"],
-                    "Kelurahan" : wilayah["Kelurahan"],
-                    "Kecamatan" : wilayah["Kecamatan"],
-                    "Kab/Kota"  : wilayah["Kab/Kota"],
-                    "Lat"       : lat,
-                    "Long"      : lon,
-                    "Keyword_Pencarian": keyword,
-                })
-
-            except Exception as e:
-                print(f"[{i}/{total}] ✗ Gagal: {e}")
-
-        browser.close()
+        finally:
+            try:
+                browser.close()
+            except Exception:
+                pass
 
     return hasil
 
