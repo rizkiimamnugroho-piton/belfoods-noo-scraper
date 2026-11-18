@@ -9,7 +9,10 @@ concurrency:
 
 jobs:
   run:
-    runs-on: ubuntu-latest
+    # Default: server GitHub (IP datacenter, lebih mudah diblokir Google Maps).
+    # Bila diblokir terus: pasang self-hosted runner di laptop/PC kantor (IP biasa), lalu isi
+    # GitHub > Settings > Secrets and variables > Actions > tab Variables > RUNNER_LABEL = self-hosted
+    runs-on: ${{ vars.RUNNER_LABEL || 'ubuntu-latest' }}
     timeout-minutes: 55
     steps:
       - uses: actions/checkout@v4
@@ -22,7 +25,12 @@ jobs:
         with:
           path: ~/.cache/ms-playwright
           key: pw-${{ runner.os }}-v1
-      - run: playwright install --with-deps chromium
+      - name: Install Chromium (server GitHub)
+        if: ${{ runner.environment == 'github-hosted' }}
+        run: playwright install --with-deps chromium
+      - name: Install Chromium (self-hosted)
+        if: ${{ runner.environment != 'github-hosted' }}
+        run: playwright install chromium
       - run: python worker.py
         env:
           GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
