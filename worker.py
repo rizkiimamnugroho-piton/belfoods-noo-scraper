@@ -5,6 +5,13 @@ WORKER NOO FINDER  (dijalankan otomatis oleh GitHub Actions)
 - Buang hasil yang sudah Covered (<= 50 m dan nama mirip), tulis sisanya ke Map_Points sebagai NOO
 CATATAN: log GitHub di repo public bisa dibaca siapa saja -> jangan print data internal.
 
+TAMBAHAN v6.2 (no HP + foto + log):
+- scraper_outlet.py v6.2 mengembalikan No_HP, No_WA, Foto_Link dan SELALU mencatat tiap pencarian ke Sheet penampung (butuh env LOG_URL dan LOG_TOKEN
+  di workflow: env: LOG_URL: ${{ secrets.LOG_URL }} / LOG_TOKEN: ${{ secrets.LOG_TOKEN }}). Pencatat = email pengguna (hanya masuk Sheet, tidak dicetak ke log).
+- NOO baru ditulis dengan kolom PHONE (format 08xx) dan FOTO LINK di Map_Points (keduanya dibawa oleh build Code.gs).
+- Hasil yang cocok dengan outlet Covered tidak jadi NOO, tetapi nomor HP/foto-nya mengisi kolom PHONE / FOTO LINK outlet Covered itu bila masih kosong,
+  dan dicatat juga di tab Phone_Scrape (KEY, OUTLET NAME, PHONE, FOTO LINK, UPDATED) supaya tidak hilang saat build ulang Map_Points dari MDS.
+
 TAMBAHAN (anti-blokir Google Maps) - logika lama di atas tidak diubah:
 - 1 keyword per pencarian (MAX_KEYWORD), sisanya dibuang
 - Jeda acak antar pencarian, batas per run / per jam / per 24 jam
@@ -48,6 +55,8 @@ COOLDOWN_MAX_MIN = 240
 ZERO_COOLDOWN_MIN = 15
 EXPIRE_HOURS = 24               # request yang menunggu lebih dari ini dibatalkan dengan pesan jelas
 STATE_SHEET = "Scraper_State"   # status bersama dengan Apps Script (cooldown, alert)
+ISI_HP_COVERED = True           # no HP / foto hasil scrape yang cocok dengan outlet Covered -> isi PHONE / FOTO LINK outlet itu bila masih kosong
+PHONE_SCRAPE_SHEET = "Phone_Scrape"
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
       "Chrome/124.0.0.0 Safari/537.36")
 
@@ -351,7 +360,9 @@ def process(req, pts_hdr, cov, known):
         for kw in kws:
             q = f"{kw}/@{la0:.6f},{lo0:.6f},{z}z"
             with contextlib.redirect_stdout(io.StringIO()):      # log scraper memuat URL berisi lokasi pengguna, jangan dicetak
-                res = so.scrape_google_maps(q, min(n * 2, 60), strict=True)
+                res = so.scrape_google_maps(q, min(n * 2, 60), strict=True,
+                                            meta={"by": req.get("USER_EMAIL", ""), "src": "WEBAPP",
+                                                  "keyword": f"{kw} (dekat lokasi, radius {rad} m)"})
             keep = []
             for r in res:
                 try:
@@ -371,11 +382,16 @@ def process(req, pts_hdr, cov, known):
             if str(req.get(k, "")).strip().upper() not in ("", "ALL")
         )
         for kw in kws:
-            raw += so.scrape_google_maps(f"{kw} {area}".strip(), n, strict=True)
+            raw += so.scrape_google_maps(f"{kw} {area}".strip(), n, strict=True,
+                                         meta={"by": req.get("USER_EMAIL", ""), "src": "WEBAPP", "keyword": f"{kw} {area}".strip()})
 
     cl, cn = cov["LAT"].to_numpy(), cov["LONG"].to_numpy()
     names = cov["OUTLET NAME"].tolist()
     new_rows, n_cov, n_dup = [], 0, 0
+    cov_up, cov_seen = [], set()      # outlet Covered yang PHONE / FOTO LINK-nya masih kosong dan kini ada dari scraping
+    hp_col = "PHONE" if "PHONE" in cov.columns else None
+    ft_col = "FOTO LINK" if "FOTO LINK" in cov.columns else None
+    kosong = lambda v: str(v).strip() in ("", "0", "nan", "None")
 
     for r in raw:
         try:
@@ -392,8 +408,17 @@ def process(req, pts_hdr, cov, known):
         if len(cl):
             d = dist_m(lat, lon, cl, cn)
             nearest = float(d.min())
-            if any(similar(r["Nama"], names[i]) for i in np.where(d <= RADIUS_M)[0]):
+            hit = [i for i in np.where(d <= RADIUS_M)[0] if similar(r["Nama"], names[i])]
+            if hit:
                 n_cov += 1
+                if ISI_HP_COVERED and (r.get("No_HP") or r.get("Foto_Link")):
+                    idx = cov.index[hit[0]]
+                    isi_hp = bool(hp_col and r.get("No_HP") and kosong(cov.at[idx, hp_col]))
+                    isi_ft = bool(ft_col and r.get("Foto_Link") and kosong(cov.at[idx, ft_col]))
+                    if (isi_hp or isi_ft) and idx not in cov_seen:
+                        cov_seen.add(idx)
+                        cov_up.append({"row": int(idx) + 2, "key": str(cov.at[idx, "KEY"]), "nama": str(cov.at[idx, "OUTLET NAME"]),
+                                       "hp": r.get("No_HP", "") if isi_hp else "", "foto": r.get("Foto_Link", "") if isi_ft else ""})
                 continue
 
         kab, kec = req.get("KAB/KOTA", ""), req.get("KECAMATAN", "")
@@ -409,11 +434,36 @@ def process(req, pts_hdr, cov, known):
             "LATLONG": f"{lat}, {lon}", "LAT": lat, "LONG": lon,
             "PIN_ICON": PIN_BASE + "noo.png", "NOO_STATUS": "New",
             "KEYWORD": r["Keyword_Pencarian"],
+            "PHONE": r.get("No_HP", ""), "FOTO LINK": r.get("Foto_Link", ""),
             "NEAREST_COVERED_M": round(nearest) if nearest is not None else "",
             "SCRAPED_AT": now(), "USER_EMAIL": req["USER_EMAIL"], "REQUEST_ID": req["REQUEST_ID"],
         }
         new_rows.append([o.get(h, "") for h in pts_hdr])
-    return len(raw), n_cov, n_dup, new_rows, extra
+    return len(raw), n_cov, n_dup, new_rows, extra, cov_up
+
+
+def simpan_phone_scrape(ss, cov_up):
+    """Catat nomor/foto outlet Covered hasil scraping di tab Phone_Scrape. Build Map_Points (Code.gs) memakainya bila PHONE di MDS kosong."""
+    try:
+        ws = ss.worksheet(PHONE_SCRAPE_SHEET)
+    except gspread.WorksheetNotFound:
+        ws = ss.add_worksheet(PHONE_SCRAPE_SHEET, rows=2000, cols=5)
+        call(ws.update, "A1:E1", [["KEY", "OUTLET NAME", "PHONE", "FOTO LINK", "UPDATED"]], value_input_option="RAW")
+    ada = {str(v).strip(): i + 2 for i, v in enumerate(call(ws.col_values, 1)[1:])}
+    now = datetime.now(timezone(timedelta(hours=7))).strftime("%Y-%m-%d %H:%M")
+    baru, ups = [], []
+    for u in cov_up:
+        if u["key"] in ada:
+            if u["hp"]:
+                ups.append({"range": f"C{ada[u['key']]}", "values": [[u["hp"]]]})
+            if u["foto"]:
+                ups.append({"range": f"D{ada[u['key']]}", "values": [[u["foto"]]]})
+        else:
+            baru.append([u["key"], u["nama"], u["hp"], u["foto"], now])
+    if baru:
+        call(ws.append_rows, baru, value_input_option="RAW")
+    if ups:
+        call(ws.batch_update, ups, value_input_option="RAW")
 
 
 def main():
@@ -498,7 +548,7 @@ def main():
         print(f"Memproses {rid} (percobaan {attempts})")
         done_run += 1
         try:
-            n_raw, n_cov, n_dup, new_rows, extra = process(req, pts_hdr, cov, known)
+            n_raw, n_cov, n_dup, new_rows, extra, cov_up = process(req, pts_hdr, cov, known)
             if n_raw == 0 and attempts < MAX_ATTEMPTS:
                 upd(req_ws, hdr, rn, STATUS="Queued", MESSAGE="0 hasil, mengulang otomatis...")
                 log(log_ws, "RETRY", f"{rid}: 0 hasil, percobaan {attempts}")
@@ -506,8 +556,22 @@ def main():
                 continue
             if new_rows:
                 call(pts_ws.append_rows, new_rows, value_input_option="RAW", table_range="A1")
+            if cov_up:      # isi PHONE / FOTO LINK outlet Covered yang masih kosong + catat di Phone_Scrape
+                ups = []
+                for u in cov_up:
+                    if u["hp"] and "PHONE" in pts_hdr:
+                        ups.append({"range": rowcol_to_a1(u["row"], pts_hdr.index("PHONE") + 1), "values": [[u["hp"]]]})
+                    if u["foto"] and "FOTO LINK" in pts_hdr:
+                        ups.append({"range": rowcol_to_a1(u["row"], pts_hdr.index("FOTO LINK") + 1), "values": [[u["foto"]]]})
+                if ups:
+                    call(pts_ws.batch_update, ups, value_input_option="RAW")
+                try:
+                    simpan_phone_scrape(ss, cov_up)
+                except Exception as e:
+                    print(f"[WARN] Phone_Scrape gagal: {str(e)[:120]}")
             pre = f"Hanya keyword pertama ('{split_kw(req['KEYWORD'])[0]}') yang dicari (1 keyword per pencarian). " if multi else ""
             msg = pre + (f"{n_raw} ditemukan{extra}, {n_cov} sudah Covered, {n_dup} duplikat, {len(new_rows)} NOO baru"
+                         + (f", HP {len(cov_up)} outlet existing terisi" if cov_up else "")
                          if n_raw else "0 hasil" + (extra + " (coba radius lebih besar atau keyword lain)" if extra
                                                     else " dari Google Maps. Keyword/area ini kemungkinan memang tidak ada hasil. "
                                                          "Bila terjadi berulang pada pencarian lain, scraper bisa jadi sedang dibatasi Google"))
