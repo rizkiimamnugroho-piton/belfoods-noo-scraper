@@ -8,15 +8,26 @@
   - scroll adaptif (berhenti otomatis jika tidak ada item baru)
   - bisa isi 1-5 keyword sekaligus, hasil digabung 1 file Excel
   - nama file output otomatis mengikuti keyword yang diisi
+  v6.2: + No HP / No WA / foto outlet (diunggah ke Drive, di Sheet hanya link)
+        + SETIAP scraping (siapa pun yang menjalankan: laptop, GitHub Actions, worker)
+          otomatis dicatat ke Google Sheet penampung (tab SCRAPE_LOG + SCRAPE_RUN)
 =============================================================
   py scraper_outlet.py
 =============================================================
 """
 
+import os
 import time
 import re
 import json
+import glob
+import uuid
+import base64
+import hashlib
+import getpass
+import socket
 import random
+from datetime import datetime
 import urllib.request
 import urllib.parse
 import pandas as pd
@@ -47,6 +58,19 @@ NAMA_FILE_OUTPUT_MANUAL = ""
 # False = pakai cara lama (tebak dari teks alamat Google Maps saja,
 #         lebih cepat tapi kadang salah tangkap nama wilayah).
 GUNAKAN_REVERSE_GEOCODING = True
+
+# ── v6.2 ─────────────────────────────────────────────────────
+AMBIL_NO_HP = True        # ambil nomor telepon dari halaman outlet
+AMBIL_FOTO  = os.environ.get("AMBIL_FOTO", "1") != "0"   # ambil foto utama outlet -> Drive (butuh LOG aktif); isi env AMBIL_FOTO=0 untuk mematikan
+FOTO_LEBAR  = 800         # lebar foto (px); tinggi otomatis 3:4
+LOG_KE_SHEET = True       # catat tiap scraping ke Google Sheet penampung
+
+# URL web app + token TIDAK ditulis di file ini (repo publik!). Isi lewat:
+#   (1) environment variable LOG_URL dan LOG_TOKEN  (GitHub Actions: Secrets), atau
+#   (2) file log_config.json di folder yang sama:  {"url": "https://script.google.com/macros/s/.../exec", "token": "..."}
+#       (masukkan log_config.json ke .gitignore)
+# Opsional: RUN_BY = nama pemakai yang ditulis di kolom "DIJALANKAN OLEH" (default: user@komputer)
+#           RUN_SOURCE = label sumber (default: LAPTOP / GITHUB ACTIONS); worker mengirim meta sendiri (email pengguna + WEBAPP)
 # ─────────────────────────────────────────────────────────────
 
 
@@ -197,6 +221,215 @@ def scrape_detail(page) -> dict:
     return {"Nama": nama, "Alamat": alamat}
 
 
+# ═════════════════════════════════════════════════════════════
+#  v6.2 — NO HP, FOTO, LOG KE GOOGLE SHEET
+# ═════════════════════════════════════════════════════════════
+def normalisasi_hp(raw) -> tuple:
+    """
+    Return (hp_lokal, wa). hp_lokal = format 08xx / 0721xxx; wa = 628xx... (kosong kalau bukan nomor seluler,
+    karena telepon rumah/kantor tidak punya WhatsApp -> tombol cukup 'Telepon').
+    """
+    if not raw or str(raw).strip() in ("", "-"):
+        return "", ""
+    d = re.sub(r"\D", "", str(raw))
+    if not d:
+        return "", ""
+    if d.startswith("62"):
+        intl = d
+    elif d.startswith("0"):
+        intl = "62" + d[1:]
+    elif d.startswith("8"):
+        intl = "62" + d
+    else:
+        return "", ""
+    if not (9 <= len(intl) <= 15):
+        return "", ""
+    lokal = "0" + intl[2:]
+    wa = intl if intl.startswith("628") else ""
+    return lokal, wa
+
+
+def ambil_no_hp(page) -> tuple:
+    """Baca nomor telepon dari panel info outlet. Return (hp_lokal, wa)."""
+    raw = ""
+    try:
+        el = page.query_selector('button[data-item-id^="phone:tel:"]')
+        if el:
+            raw = (el.get_attribute("data-item-id") or "").split("phone:tel:", 1)[-1]
+            if not re.search(r"\d{6,}", raw):
+                raw = el.get_attribute("aria-label") or el.inner_text() or ""
+        if not raw:
+            el = page.query_selector('button[aria-label^="Telepon"], button[aria-label^="Phone"]')
+            if el:
+                raw = el.get_attribute("aria-label") or el.inner_text() or ""
+    except Exception:
+        pass
+    return normalisasi_hp(raw)
+
+
+def ambil_url_foto(page) -> str:
+    """URL foto utama outlet (diperbesar ke FOTO_LEBAR). Kosong kalau outlet tidak punya foto."""
+    try:
+        page.wait_for_selector('img[src*="googleusercontent.com"]', timeout=2500)
+    except Exception:
+        pass
+    cands = []
+    for sel in ['button[jsaction*="heroHeaderImage"] img', 'button.aoRNLd img',
+                'div[role="main"] img[src*="googleusercontent.com/p/"]',
+                'img[src*="googleusercontent.com/p/"]', 'img[src*="gps-cs-s"]']:
+        try:
+            for el in page.query_selector_all(sel)[:3]:
+                cands.append(el.get_attribute("src") or "")
+        except Exception:
+            pass
+    try:
+        el = page.query_selector('meta[property="og:image"]')
+        if el:
+            cands.append(el.get_attribute("content") or "")
+    except Exception:
+        pass
+    for u in cands:
+        if not u.startswith("http"):
+            continue
+        low = u.lower()
+        if "staticmap" in low or "/maps/vt" in low or "streetviewpixels" in low or "favicon" in low:
+            continue
+        if "googleusercontent" not in low and "ggpht" not in low:
+            continue
+        tinggi = int(FOTO_LEBAR * 0.75)
+        if re.search(r"=[wsh]\d+", u):
+            u = re.sub(r"=[wsh]\d+[^/?]*$", f"=w{FOTO_LEBAR}-h{tinggi}-k-no", u)
+        return u
+    return ""
+
+
+# ---------- koneksi ke web app penampung (LogScrape.gs) ----------
+def _muat_log_config():
+    url = os.environ.get("LOG_URL", "").strip()
+    token = os.environ.get("LOG_TOKEN", "").strip()
+    if not (url and token):
+        f = os.path.join(os.path.dirname(os.path.abspath(__file__)), "log_config.json")
+        if os.path.exists(f):
+            try:
+                c = json.load(open(f, encoding="utf-8"))
+                url = url or str(c.get("url", "")).strip()
+                token = token or str(c.get("token", "")).strip()
+            except Exception:
+                pass
+    return url, token
+
+
+_LOG_URL, _LOG_TOKEN = _muat_log_config()
+_LOG_AKTIF = bool(LOG_KE_SHEET and _LOG_URL and _LOG_TOKEN)
+
+
+def _meta_default() -> dict:
+    try:
+        by = os.environ.get("RUN_BY") or f"{getpass.getuser()}@{socket.gethostname()}"
+    except Exception:
+        by = os.environ.get("RUN_BY") or "tidak diketahui"
+    src = os.environ.get("RUN_SOURCE") or ("GITHUB ACTIONS" if os.environ.get("GITHUB_ACTIONS") else "LAPTOP")
+    return {"by": by, "src": src}
+
+
+def _post_json(url: str, payload: dict, timeout: int = 90, coba: int = 3) -> dict:
+    """POST JSON ke web app Apps Script (302 -> GET hasil diikuti otomatis oleh urllib). Retry 3x."""
+    payload = dict(payload, token=_LOG_TOKEN)
+    data = json.dumps(payload).encode("utf-8")
+    err = None
+    for t in range(coba):
+        try:
+            req = urllib.request.Request(url, data=data, method="POST",
+                                         headers={"Content-Type": "text/plain;charset=utf-8"})
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                res = json.loads(r.read().decode("utf-8"))
+            if not res.get("ok"):
+                raise RuntimeError(res.get("error", "respon tidak OK"))
+            return res
+        except Exception as e:
+            err = e
+            time.sleep(2 * (t + 1))
+    raise RuntimeError(f"gagal kirim ke penampung: {str(err)[:120]}")
+
+
+def proses_foto(page, nama: str, lat, lon) -> str:
+    """Unduh foto outlet dari Google Maps lalu unggah ke Drive lewat web app. Return link Drive ('' kalau gagal / tidak ada)."""
+    if not (AMBIL_FOTO and _LOG_AKTIF):
+        return ""
+    try:
+        src = ambil_url_foto(page)
+        if not src:
+            return ""
+        resp = page.context.request.get(src, timeout=15000)
+        if not resp.ok:
+            return ""
+        body = resp.body()
+        mime = (resp.headers.get("content-type") or "image/jpeg").split(";")[0].strip()
+        if not body or len(body) > 4_500_000 or not mime.startswith("image/"):
+            return ""
+        kunci = hashlib.sha1(f"{nama}|{lat}|{lon}".encode("utf-8")).hexdigest()[:10]
+        slug = re.sub(r"[^A-Za-z0-9]+", "_", nama).strip("_")[:40] or "OUTLET"
+        res = _post_json(_LOG_URL, {"action": "photo", "name": f"{slug}_{kunci}", "mime": mime,
+                                    "b64": base64.b64encode(body).decode("ascii")}, timeout=90, coba=2)
+        return res.get("url", "")
+    except Exception as e:
+        print(f"         ⚠ foto dilewati: {str(e)[:80]}")
+        return ""
+
+
+def _kirim_paket(paket: dict) -> bool:
+    try:
+        _post_json(_LOG_URL, dict(paket, action="rows"))
+        return True
+    except Exception as e:
+        print(f"[WARN] {e}")
+        return False
+
+
+def _kirim_pending():
+    """Kirim ulang paket log yang dulu gagal terkirim (file log_pending_*.json)."""
+    for f in glob.glob("log_pending_*.json"):
+        try:
+            if _kirim_paket(json.load(open(f, encoding="utf-8"))):
+                os.remove(f)
+                print(f"[INFO] log tertunda terkirim: {f}")
+        except Exception:
+            pass
+
+
+def kirim_log(rows: list, keyword: str, target: int, status: str, pesan: str, meta, durasi: float):
+    """Catat 1 kali scraping (1 keyword) ke Sheet penampung. Tidak pernah membuat scraping gagal."""
+    if not _LOG_AKTIF:
+        return
+    m = _meta_default()
+    m.update(meta or {})
+    run_id = datetime.now().strftime("%y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:4]
+    data = [{
+        "nama": r.get("Nama", ""), "alamat": r.get("Alamat", ""), "kel": r.get("Kelurahan", ""),
+        "kec": r.get("Kecamatan", ""), "kab": r.get("Kab/Kota", ""), "lat": r.get("Lat", ""), "lon": r.get("Long", ""),
+        "hp": r.get("No_HP", ""), "wa": r.get("No_WA", ""), "foto": r.get("Foto_Link", ""), "maps": r.get("Link_Maps", ""),
+    } for r in rows]
+    ket = "OK" if (rows or status != "OK") else "KOSONG"
+    base = {"meta": {"by": m["by"], "src": m["src"], "runId": run_id, "keyword": m.get("keyword") or keyword},
+            "run": {"target": target, "found": len(rows), "hp": sum(1 for r in rows if r.get("No_HP")),
+                    "foto": sum(1 for r in rows if r.get("Foto_Link")), "durasi": round(durasi),
+                    "status": status if status != "OK" else ket, "pesan": pesan}}
+    _kirim_pending()
+    pecah = [data[i:i + 100] for i in range(0, len(data), 100)] or [[]]
+    semua_ok = True
+    for i, chunk in enumerate(pecah):
+        paket = dict(base, rows=chunk)
+        if i > 0:
+            paket.pop("run")
+        if not _kirim_paket(paket):
+            semua_ok = False
+            fn = f"log_pending_{run_id}_{i}.json"
+            json.dump(paket, open(fn, "w", encoding="utf-8"))
+            print(f"[WARN] log disimpan lokal ({fn}), akan dikirim ulang pada scraping berikutnya.")
+    if semua_ok:
+        print(f"[INFO] Log tercatat di Sheet penampung: {len(rows)} outlet (run {run_id})")
+
+
 class MapsBlocked(Exception):
     """Google Maps menolak / membatasi akses (captcha, consent tak bisa dilewati, halaman asing, koneksi ditutup)."""
 
@@ -247,14 +480,14 @@ def _jenis_halaman(page) -> str:
     return "ASING"
 
 
-def scrape_google_maps(keyword: str, jumlah: int, strict: bool = False) -> list:
+def _scrape_inti(keyword: str, jumlah: int, strict: bool, hasil: list) -> list:
     """
     strict=False (default, perilaku lama CLI): panel tidak muncul -> print error, return [].
     strict=True  (dipakai worker): bedakan "memang tidak ada hasil" (return []) dari "diblokir / halaman asing"
                  (raise MapsBlocked), supaya worker bisa menunda scraper, bukan mencatat 0 hasil palsu.
     """
-    hasil = []
-
+    # 'hasil' diisi bertahap (dari pembungkus scrape_google_maps) supaya hasil parsial tetap
+    # tercatat di Sheet walau scraping terputus di tengah jalan.
     with sync_playwright() as p:
         print("[INFO] Membuka browser (headless/tanpa tampilan)...")
         browser = p.chromium.launch(
@@ -374,6 +607,15 @@ def scrape_google_maps(keyword: str, jumlah: int, strict: bool = False) -> list:
                     lat, lon    = parse_latlong_dari_url(current_url)
                     detail      = scrape_detail(page)
 
+                    hp, wa, foto_link = "", "", ""
+                    if AMBIL_NO_HP:
+                        try:   # tunggu panel info (alamat/telepon) tampil
+                            page.wait_for_selector('button[data-item-id="address"]', timeout=3000)
+                        except PWTimeout:
+                            pass
+                        hp, wa = ambil_no_hp(page)
+                    foto_link = proses_foto(page, detail["Nama"], lat, lon)
+
                     wilayah = None
                     if GUNAKAN_REVERSE_GEOCODING:
                         wilayah = ambil_wilayah_dari_koordinat(lat, lon)
@@ -383,6 +625,7 @@ def scrape_google_maps(keyword: str, jumlah: int, strict: bool = False) -> list:
 
                     print(f"[{i}/{total}] {detail['Nama'][:50]}")
                     print(f"         {wilayah['Kelurahan']} | {wilayah['Kecamatan']} | {wilayah['Kab/Kota']} | {lat}, {lon}")
+                    print(f"         HP: {'ada' if hp else '-'} | WA: {'ada' if wa else '-'} | Foto: {'ada' if foto_link else '-'}")   # nomor tidak dicetak (log GitHub publik)
 
                     hasil.append({
                         "Nama"      : detail["Nama"],
@@ -393,6 +636,11 @@ def scrape_google_maps(keyword: str, jumlah: int, strict: bool = False) -> list:
                         "Lat"       : lat,
                         "Long"      : lon,
                         "Keyword_Pencarian": keyword,
+                        "No_HP"     : hp,
+                        "No_WA"     : wa,
+                        "Link_WA"   : f"https://wa.me/{wa}" if wa else "",
+                        "Foto_Link" : foto_link,
+                        "Link_Maps" : current_url,
                     })
                     gagal_net = 0
 
@@ -414,16 +662,42 @@ def scrape_google_maps(keyword: str, jumlah: int, strict: bool = False) -> list:
     return hasil
 
 
+def scrape_google_maps(keyword: str, jumlah: int, strict: bool = False, meta: dict = None) -> list:
+    """
+    Pembungkus: menjalankan scraping 1 keyword lalu SELALU mencatat hasilnya (termasuk yang 0 hasil / diblokir)
+    ke Sheet penampung bila LOG_URL & LOG_TOKEN terisi.
+    meta (opsional): {"by": "nama pemakai", "src": "WEBAPP"} -> kolom DIJALANKAN OLEH / SUMBER.
+    Perilaku strict dan nilai kembalian sama seperti sebelumnya.
+    """
+    kumpul, status, pesan, t0 = [], "OK", "", time.time()
+    try:
+        return _scrape_inti(keyword, jumlah, strict, kumpul)
+    except MapsBlocked as e:
+        status, pesan = "BLOCKED", str(e)[:200]
+        raise
+    except Exception as e:
+        status, pesan = "ERROR", str(e)[:200]
+        raise
+    finally:
+        try:
+            kirim_log(kumpul, keyword, jumlah, status, pesan, meta, time.time() - t0)
+        except Exception as e:
+            print(f"[WARN] log gagal: {e}")
+
+
 def simpan_hasil(data: list, nama_file: str):
     if not data:
         print("\n[WARN] Tidak ada data.")
         return
 
-    kolom = ["Nama","Alamat","Kelurahan","Kecamatan","Kab/Kota","Lat","Long","Keyword_Pencarian"]
+    kolom = ["Nama","Alamat","Kelurahan","Kecamatan","Kab/Kota","Lat","Long","Keyword_Pencarian",
+             "No_HP","No_WA","Link_WA","Foto_Link","Link_Maps"]
     df = pd.DataFrame(data, columns=kolom)
 
     for col in ["Nama","Alamat","Kelurahan","Kecamatan","Kab/Kota"]:
         df[col] = df[col].apply(lambda x: re.sub(r'\s+', ' ', str(x)).strip())
+    for col in ["No_HP","No_WA","Link_WA","Foto_Link","Link_Maps"]:
+        df[col] = df[col].fillna("").astype(str)
 
     # Hapus duplikat kalau outlet yang sama muncul di lebih dari satu keyword
     sebelum = len(df)
@@ -440,7 +714,7 @@ def simpan_hasil(data: list, nama_file: str):
     print(f"  Total: {len(df)} outlet")
     print(f"{'─'*70}")
     pd.set_option('display.max_colwidth', 28)
-    print(df[["Nama","Kelurahan","Kecamatan","Kab/Kota","Lat","Long","Keyword_Pencarian"]].to_string(index=False))
+    print(df[["Nama","Kelurahan","Kecamatan","Kab/Kota","No_HP","Keyword_Pencarian"]].to_string(index=False))
 
 
 if __name__ == "__main__":
@@ -454,13 +728,15 @@ if __name__ == "__main__":
     nama_file_final = NAMA_FILE_OUTPUT_MANUAL.strip() or buat_nama_file_otomatis(keyword_terisi)
 
     print("=" * 65)
-    print("  GOOGLE MAPS OUTLET SCRAPER  v6 (multi-keyword)")
+    print("  GOOGLE MAPS OUTLET SCRAPER  v6.2 (multi-keyword + HP + foto + log)")
     print("=" * 65)
     print(f"  Jumlah keyword : {len(keyword_terisi)}")
     for i, k in enumerate(keyword_terisi, 1):
         print(f"    {i}. {k}")
     print(f"  Target/keyword : {JUMLAH_OUTLET_PER_KEYWORD} outlet")
     print(f"  File output    : {nama_file_final}.xlsx")
+    print(f"  Log ke Sheet   : {'AKTIF' if _LOG_AKTIF else 'NONAKTIF (LOG_URL / LOG_TOKEN belum diisi)'}")
+    print(f"  Foto -> Drive  : {'ya' if (AMBIL_FOTO and _LOG_AKTIF) else 'tidak'}")
     print("=" * 65 + "\n")
 
     data_gabungan = []
