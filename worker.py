@@ -350,6 +350,18 @@ def load_points(pts_ws):
     return hdr, cov, known
 
 
+def ensure_cols(pts_ws, pts_hdr, names):
+    """Tambahkan kolom yang belum ada di kanan header Map_Points (mis. GMAPS_EXTRA) agar data tidak hilang."""
+    miss = [n for n in names if n not in pts_hdr]
+    if not miss:
+        return pts_hdr
+    need = len(pts_hdr) + len(miss)
+    if pts_ws.col_count < need:
+        call(pts_ws.add_cols, need - pts_ws.col_count)
+    call(pts_ws.update, rowcol_to_a1(1, len(pts_hdr) + 1) + ":" + rowcol_to_a1(1, need), [miss], value_input_option="RAW")
+    return pts_hdr + miss
+
+
 def load_titik_distributor(ss, cov):
     """Muat tab Titik_Distributor (DISTRIBUTOR NAME | LAT | LONG, atau satu kolom LATLONG) ke scraper_outlet.
     Hanya distributor aktif (kolom STTS DIST di Map_Points) bila informasinya ada. Gagal membaca tidak menghentikan worker."""
@@ -552,6 +564,7 @@ def main():
         return
 
     pts_hdr, cov, known = load_points(pts_ws)
+    pts_hdr = ensure_cols(pts_ws, pts_hdr, ["GMAPS_EXTRA"])
     print(f"Covered dengan GPS: {len(cov)}")
     load_titik_distributor(ss, cov)
     log(log_ws, "START", f"Covered dengan GPS: {len(cov)}")
