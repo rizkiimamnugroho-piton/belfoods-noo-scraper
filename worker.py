@@ -12,6 +12,13 @@ TAMBAHAN v6.2 (no HP + foto + log):
 - Hasil yang cocok dengan outlet Covered tidak jadi NOO, tetapi nomor HP/foto-nya mengisi kolom PHONE / FOTO LINK outlet Covered itu bila masih kosong,
   dan dicatat juga di tab Phone_Scrape (KEY, OUTLET NAME, PHONE, FOTO LINK, UPDATED) supaya tidak hilang saat build ulang Map_Points dari MDS.
 
+TAMBAHAN v6.3 (24 Nov 2026):
+- MODE = FREE (pencarian bebas): KEYWORD dipakai apa adanya di Google Maps, tanpa kab/kec/radius dan tanpa penyaringan wilayah.
+  Kab/kec/kelurahan diambil dari reverse-geocoding titik hasil (seperti mode NEARBY).
+- Tab Titik_Distributor dimuat dulu (set_titik_distributor) -> tiap hasil punya distributor terdekat + jarak (garis lurus).
+  Bila DISTRIBUTOR NAME pada request = AUTO (atau kosong), NOO ditulis atas nama distributor terdekat itu.
+- Kolom GMAPS_EXTRA (JSON: rating, ulasan, website, kategori, jam, url) ikut ditulis bila kolomnya ada di Map_Points.
+
 TAMBAHAN (anti-blokir Google Maps) - logika lama di atas tidak diubah:
 - 1 keyword per pencarian (MAX_KEYWORD), sisanya dibuang
 - Jeda acak antar pencarian, batas per run / per jam / per 24 jam
@@ -343,6 +350,58 @@ def load_points(pts_ws):
     return hdr, cov, known
 
 
+def load_titik_distributor(ss, cov):
+    """Muat tab Titik_Distributor (DISTRIBUTOR NAME | LAT | LONG, atau satu kolom LATLONG) ke scraper_outlet.
+    Hanya distributor aktif (kolom STTS DIST di Map_Points) bila informasinya ada. Gagal membaca tidak menghentikan worker."""
+    try:
+        key = lambda s: re.sub(r"[^a-z]", "", str(s).lower())
+        ws = next((w for w in ss.worksheets() if key(w.title) == "titikdistributor"), None)
+        if ws is None:
+            print("Tab Titik_Distributor tidak ada: distributor terdekat tidak dihitung.")
+            return 0
+        v = call(ws.get_all_values)
+        if len(v) < 2:
+            return 0
+        U = [re.sub(r"[_.\-/]+", " ", str(h).upper()).strip() for h in v[0]]
+        f = lambda pat: next((i for i, h in enumerate(U) if re.search(pat, h)), -1)
+        iN, iA, iO, iL = f(r"DISTRIBUTOR|NAMA|NAME"), f(r"^LAT"), f(r"^(LONG|LNG|LON)"), f(r"LATLONG|KOORDINAT|COORD")
+        if iN < 0:
+            iN = 0
+        if iA < 0 and iL < 0:
+            iA, iO = 1, 2
+        nz = lambda s: re.sub(r"\s+", " ", str(s).strip().upper())
+        aktif = {}
+        if "STTS DIST" in cov.columns and "DISTRIBUTOR NAME" in cov.columns:
+            for n, s in zip(cov["DISTRIBUTOR NAME"], cov["STTS DIST"]):
+                su = str(s).upper()
+                if re.search(r"ACTIVE|AKTIF", su) and not re.search(r"INACTIVE|NON", su):
+                    aktif[nz(n)] = str(n).strip()
+        out = []
+        for r in v[1:]:
+            raw = str(r[iN]).strip() if len(r) > iN else ""
+            if not raw:
+                continue
+            try:
+                if iA >= 0 and iO >= 0:
+                    la, lo = float(str(r[iA]).strip().replace(",", ".")), float(str(r[iO]).strip().replace(",", "."))
+                else:
+                    m = re.search(r"(-?\d+(?:\.\d+)?)\s*[,;]\s*(-?\d+(?:\.\d+)?)", str(r[iL]))
+                    la, lo = float(m.group(1)), float(m.group(2))
+            except Exception:
+                continue
+            if not (-12 <= la <= 7 and 94 <= lo <= 142):
+                continue
+            if aktif and nz(raw) not in aktif:
+                continue
+            out.append((aktif.get(nz(raw), raw), la, lo))
+        so.set_titik_distributor(out)
+        print(f"Titik distributor dimuat: {len(out)}")
+        return len(out)
+    except Exception as e:
+        print(f"[WARN] Titik_Distributor gagal dimuat: {mask(str(e))[:120]}")
+        return 0
+
+
 def split_kw(raw):
     return [k.strip() for k in str(raw).split(",") if k.strip()]
 
@@ -350,7 +409,8 @@ def split_kw(raw):
 def process(req, pts_hdr, cov, known):
     kws = split_kw(req["KEYWORD"])[:MAX_KEYWORD]       # 1 keyword per pencarian
     n = int(float(req.get("MAX_RESULTS") or 20))
-    nearby = str(req.get("MODE", "")).strip().upper() == "NEARBY"
+    mode = str(req.get("MODE", "")).strip().upper()
+    nearby, free = mode == "NEARBY", mode == "FREE"
     raw, extra = [], ""
     if nearby:
         # Mode "dekat lokasi saya": cari di sekitar titik (LAT, LONG) dengan RADIUS_M, urut dari yang terdekat.
@@ -376,6 +436,11 @@ def process(req, pts_hdr, cov, known):
                     keep.append(r)
             keep.sort(key=lambda r: r["_jarak"])
             raw += keep[:n]
+    elif free:
+        # PENCARIAN BEBAS: KEYWORD = kalimat pencarian utuh (contoh "grosir sembako Pontianak"), tanpa penyaringan wilayah.
+        for kw in kws:
+            raw += so.scrape_google_maps(kw, n, strict=True,
+                                         meta={"by": req.get("USER_EMAIL", ""), "src": "WEBAPP", "keyword": f"{kw} (bebas)"})
     else:
         area = " ".join(
             str(req.get(k, "")).strip() for k in ("KELURAHAN", "KECAMATAN", "KAB/KOTA")
@@ -422,11 +487,14 @@ def process(req, pts_hdr, cov, known):
                 continue
 
         kab, kec = req.get("KAB/KOTA", ""), req.get("KECAMATAN", "")
-        if nearby:                                  # wilayah diambil dari hasil reverse-geocoding titiknya
+        if nearby or free:                          # wilayah diambil dari hasil reverse-geocoding titiknya
             kab, kec = norm_kab(r["Kab/Kota"]), norm_kec(r["Kecamatan"])
+        dname = req["DISTRIBUTOR NAME"]
+        if str(dname).strip().upper() in ("", "AUTO"):         # pencarian bebas tanpa distributor: pakai yang terdekat dari titik hasil
+            dname = r.get("Distributor_Terdekat") or dname
         o = {
             "KEY": "NOO-" + uuid.uuid4().hex[:10].upper(), "TYPE": "NOO",
-            "OUTLET NAME": r["Nama"], "DISTRIBUTOR NAME": req["DISTRIBUTOR NAME"],
+            "OUTLET NAME": r["Nama"], "DISTRIBUTOR NAME": dname,
             "OUTLET STATUS": "NOO",
             "KAB/KOTA": kab, "KECAMATAN": kec,
             "KELURAHAN": r["Kelurahan"], "ALAMAT": r["Alamat"],
@@ -437,6 +505,7 @@ def process(req, pts_hdr, cov, known):
             "PHONE": r.get("No_HP", ""), "FOTO LINK": r.get("Foto_Link", ""),
             "NEAREST_COVERED_M": round(nearest) if nearest is not None else "",
             "SCRAPED_AT": now(), "USER_EMAIL": req["USER_EMAIL"], "REQUEST_ID": req["REQUEST_ID"],
+            "GMAPS_EXTRA": so.gmaps_extra_json(r),
         }
         new_rows.append([o.get(h, "") for h in pts_hdr])
     return len(raw), n_cov, n_dup, new_rows, extra, cov_up
@@ -484,6 +553,7 @@ def main():
 
     pts_hdr, cov, known = load_points(pts_ws)
     print(f"Covered dengan GPS: {len(cov)}")
+    load_titik_distributor(ss, cov)
     log(log_ws, "START", f"Covered dengan GPS: {len(cov)}")
 
     t0 = time.time()
