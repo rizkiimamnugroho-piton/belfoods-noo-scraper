@@ -8,6 +8,7 @@
   - scroll adaptif (berhenti otomatis jika tidak ada item baru)
   - bisa isi 1-5 keyword sekaligus, hasil digabung 1 file Excel
   - nama file output otomatis mengikuti keyword yang diisi
+  v6.3: + rating, ulasan, website, kategori, jam buka, distributor terdekat + jarak (bila titik distributor diisi worker)
   v6.2: + No HP / No WA / foto outlet (diunggah ke Drive, di Sheet hanya link)
         + SETIAP scraping (siapa pun yang menjalankan: laptop, GitHub Actions, worker)
           otomatis dicatat ke Google Sheet penampung (tab SCRAPE_LOG + SCRAPE_RUN)
@@ -303,6 +304,101 @@ def ambil_url_foto(page) -> str:
     return ""
 
 
+# ═════════════════════════════════════════════════════════════
+#  v6.3 (24 Nov 2026) — data lebih lengkap + distributor terdekat
+# ═════════════════════════════════════════════════════════════
+def ambil_info_tambahan(page) -> dict:
+    """Rating, jumlah ulasan, website, kategori Google, jam buka dari panel info outlet. Semua opsional ('' bila tidak ada)."""
+    out = {"Rating": "", "Ulasan": "", "Website": "", "Kategori": "", "Jam_Buka": ""}
+    try:
+        el = page.query_selector('div.F7nice span[aria-hidden="true"]')
+        if el:
+            t = (el.inner_text() or "").strip().replace(",", ".")
+            if re.fullmatch(r"\d(\.\d)?", t):
+                out["Rating"] = float(t)
+    except Exception:
+        pass
+    try:
+        el = page.query_selector('div.F7nice span[aria-label*="ulasan"], div.F7nice span[aria-label*="review"]')
+        if el:
+            d = re.sub(r"\D", "", el.get_attribute("aria-label") or el.inner_text() or "")
+            if d:
+                out["Ulasan"] = int(d)
+    except Exception:
+        pass
+    try:
+        el = page.query_selector('a[data-item-id="authority"]')
+        if el:
+            out["Website"] = (el.get_attribute("href") or "").strip()[:200]
+    except Exception:
+        pass
+    for sel in ('button.DkEaL', 'button[jsaction*="category"]'):
+        try:
+            el = page.query_selector(sel)
+            if el:
+                t = re.sub(r"\s+", " ", el.inner_text() or "").strip()
+                if t:
+                    out["Kategori"] = t[:80]
+                    break
+        except Exception:
+            pass
+    try:
+        el = page.query_selector('[data-item-id="oh"]')
+        if el:
+            t = el.get_attribute("aria-label") or el.inner_text() or ""
+            out["Jam_Buka"] = re.sub(r"\s+", " ", t).strip()[:160]
+    except Exception:
+        pass
+    return out
+
+
+# Titik gudang distributor: [(nama, lat, lon), ...]. Diisi oleh worker (dari tab Titik_Distributor) lewat set_titik_distributor().
+# Kosong -> kolom distributor terdekat dibiarkan kosong (aman untuk dijalankan dari laptop).
+DIST_POINTS = []
+
+
+def set_titik_distributor(titik):
+    global DIST_POINTS
+    out = []
+    for t in titik or []:
+        try:
+            out.append((str(t[0]).strip(), float(t[1]), float(t[2])))
+        except Exception:
+            pass
+    DIST_POINTS = out
+
+
+def _km(la1, lo1, la2, lo2) -> float:
+    import math
+    r, d = 6371.0, math.pi / 180
+    a = (math.sin((la2 - la1) * d / 2) ** 2
+         + math.cos(la1 * d) * math.cos(la2 * d) * math.sin((lo2 - lo1) * d / 2) ** 2)
+    return r * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+
+def distributor_terdekat(lat, lon) -> list:
+    """Dua distributor terdekat (nama unik) sebagai [(nama, km), ...]; jarak garis lurus."""
+    try:
+        la, lo = float(lat), float(lon)
+    except Exception:
+        return []
+    if not DIST_POINTS:
+        return []
+    best = {}
+    for n, a, b in DIST_POINTS:
+        k = _km(la, lo, a, b)
+        if n not in best or k < best[n]:
+            best[n] = k
+    return sorted(best.items(), key=lambda x: x[1])[:2]
+
+
+def gmaps_extra_json(r: dict) -> str:
+    """Isi kolom GMAPS_EXTRA di Map_Points (satu kolom JSON; dipecah jadi kolom oleh HubScrape.gs)."""
+    o = {"rating": r.get("Rating", ""), "ulasan": r.get("Ulasan", ""), "website": r.get("Website", ""),
+         "kategori": r.get("Kategori", ""), "jam": r.get("Jam_Buka", ""), "url": r.get("Link_Maps", "")}
+    return json.dumps({k: v for k, v in o.items() if v not in ("", None)}, ensure_ascii=False)
+
+
 # ---------- koneksi ke web app penampung (LogScrape.gs) ----------
 def _muat_log_config():
     url = os.environ.get("LOG_URL", "").strip()
@@ -408,6 +504,10 @@ def kirim_log(rows: list, keyword: str, target: int, status: str, pesan: str, me
         "nama": r.get("Nama", ""), "alamat": r.get("Alamat", ""), "kel": r.get("Kelurahan", ""),
         "kec": r.get("Kecamatan", ""), "kab": r.get("Kab/Kota", ""), "lat": r.get("Lat", ""), "lon": r.get("Long", ""),
         "hp": r.get("No_HP", ""), "wa": r.get("No_WA", ""), "foto": r.get("Foto_Link", ""), "maps": r.get("Link_Maps", ""),
+        "rating": r.get("Rating", ""), "ulasan": r.get("Ulasan", ""), "web": r.get("Website", ""),
+        "kat": r.get("Kategori", ""), "jam": r.get("Jam_Buka", ""),
+        "distn": r.get("Distributor_Terdekat", ""), "distkm": r.get("Jarak_Distributor_Km", ""),
+        "dist2": r.get("Distributor_Terdekat_2", ""), "dist2km": r.get("Jarak_2_Km", ""),
     } for r in rows]
     ket = "OK" if (rows or status != "OK") else "KOSONG"
     base = {"meta": {"by": m["by"], "src": m["src"], "runId": run_id, "keyword": m.get("keyword") or keyword},
@@ -616,6 +716,8 @@ def _scrape_inti(keyword: str, jumlah: int, strict: bool, hasil: list) -> list:
                         hp, wa = ambil_no_hp(page)
                     foto_link = proses_foto(page, detail["Nama"], lat, lon)
 
+                    info = ambil_info_tambahan(page)
+                    dn = distributor_terdekat(lat, lon)
                     wilayah = None
                     if GUNAKAN_REVERSE_GEOCODING:
                         wilayah = ambil_wilayah_dari_koordinat(lat, lon)
@@ -641,6 +743,15 @@ def _scrape_inti(keyword: str, jumlah: int, strict: bool, hasil: list) -> list:
                         "Link_WA"   : f"https://wa.me/{wa}" if wa else "",
                         "Foto_Link" : foto_link,
                         "Link_Maps" : current_url,
+                        "Rating"    : info["Rating"],
+                        "Ulasan"    : info["Ulasan"],
+                        "Website"   : info["Website"],
+                        "Kategori"  : info["Kategori"],
+                        "Jam_Buka"  : info["Jam_Buka"],
+                        "Distributor_Terdekat"  : dn[0][0] if dn else "",
+                        "Jarak_Distributor_Km"  : round(dn[0][1], 1) if dn else "",
+                        "Distributor_Terdekat_2": dn[1][0] if len(dn) > 1 else "",
+                        "Jarak_2_Km"            : round(dn[1][1], 1) if len(dn) > 1 else "",
                     })
                     gagal_net = 0
 
@@ -691,7 +802,9 @@ def simpan_hasil(data: list, nama_file: str):
         return
 
     kolom = ["Nama","Alamat","Kelurahan","Kecamatan","Kab/Kota","Lat","Long","Keyword_Pencarian",
-             "No_HP","No_WA","Link_WA","Foto_Link","Link_Maps"]
+             "No_HP","No_WA","Link_WA","Foto_Link","Link_Maps",
+             "Rating","Ulasan","Website","Kategori","Jam_Buka",
+             "Distributor_Terdekat","Jarak_Distributor_Km","Distributor_Terdekat_2","Jarak_2_Km"]
     df = pd.DataFrame(data, columns=kolom)
 
     for col in ["Nama","Alamat","Kelurahan","Kecamatan","Kab/Kota"]:
